@@ -9,6 +9,7 @@ from math import ceil
 import os.path
 from pathlib import Path
 import sys
+from typing import Any
 
 from colour import Color
 import numpy as np
@@ -196,6 +197,22 @@ def apply_new_border(image: Image.Image, config: BorderConfig) \
     return new_image
 
 
+def get_image_write_params(image: Image.Image) -> dict[str, Any]:
+    write_params: dict[str, Any] = {
+        # Preserve metadata
+        'icc_profile': image.info.get('icc_profile'),   # Colour profile
+        'exif': image.getexif()     # Camera info and such
+    }
+    if image.format == 'JPEG':
+        # Default JPG writing settings are garbage. Aim to preserve quality as much as possible.
+        write_params |= {
+            'quality': 95,
+            'subsampling': 0,
+            'optimize': True
+        }
+    return write_params
+
+
 def process_image(input_path: Path, output_path: Path, config: AppConfig) -> None:
     logger.info(f'Processing \'{input_path}\'')
     try:
@@ -204,6 +221,9 @@ def process_image(input_path: Path, output_path: Path, config: AppConfig) -> Non
         # Ignore files which are not images.
         logger.info(f'Ignored non-image file')
         return
+
+    # We're trying to preserve as much as possible from the original image, so save the info now in case it's changed.
+    write_params = get_image_write_params(image)
 
     match config.existing_border_handling:
         case ExistingBorderHandling.ADD:
@@ -224,8 +244,7 @@ def process_image(input_path: Path, output_path: Path, config: AppConfig) -> Non
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if not config.allow_overwrite and output_path.exists():
             raise AppError(f'Would overwrite existing file: \'{output_path}\'')
-        # Try to preserve all image metadata. Not sure if this is 100% legit but it seems to work.
-        image.save(output_path, **image.info)
+        image.save(output_path, **write_params)
         logger.info(f'Saved image to \'{output_path}\'')
 
 
