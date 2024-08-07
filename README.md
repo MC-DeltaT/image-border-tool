@@ -14,3 +14,4 @@ A command line tool for intelligently adding borders to images.
 
 - Python 3.12
 - See [`requirements.txt`](requirements.txt)
+- For testing, see [`requirements-unittest.txt`](requirements-unittest.txt)
