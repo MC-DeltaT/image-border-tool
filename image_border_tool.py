@@ -61,7 +61,10 @@ def get_config(args: list[str]) -> AppConfig:
     parser.add_argument('--existing-border', type=ExistingBorderHandling,
         choices=list(ExistingBorderHandling),
         default=ExistingBorderHandling.SKIP,
-        help='How to handle images with existing borders. skip: Don\'t process the image. add: Add the new border anyway')
+        help='How to handle images with existing borders. '
+            f'{ExistingBorderHandling.SKIP}: Don\'t process the image. '
+            f'{ExistingBorderHandling.ADD}: Add the new border anyway. '
+            f'{ExistingBorderHandling.REPLACE}: Replace the existing border.')
     parser.add_argument('--border-colour', type=Color, default='white',
         help='Border colour, as a W3C colour name.')
     parser.add_argument('--border-size', type=float, default=0.1,
