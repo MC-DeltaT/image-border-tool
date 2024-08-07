@@ -21,8 +21,9 @@ logging.basicConfig(style='{', format='{levelname}: {message}')
 
 
 class ExistingBorderHandling(Enum):
-    SKIP = 'skip'   # Skip file
-    ADD = 'add'     # Add a border anyway
+    SKIP = 'skip'       # Skip file
+    ADD = 'add'         # Add a border anyway
+    REPLACE = 'replace' # Remove old border and add new one
 
     # For argparse help output.
     def __str__(self):
@@ -126,38 +127,79 @@ def validate_output_paths(output_paths: Iterable[Path], allow_overwrite: bool) -
             raise AppError(AppError(f'Would overwrite existing files: {existing_str}'))
 
 
+@dataclass(frozen=True)
+class BorderSize:
+    # Size in pixels of the border on each side.
+    top: int
+    bottom: int
+    left: int
+    right: int
+
+    @property
+    def pil_tuple(self) -> tuple[int, int, int, int]:
+        """As used in various PIL functions: left, top, right, bottom."""
+
+        return (self.left, self.top, self.right, self.bottom)
+
+    def __bool__(self) -> bool:
+        """Truthy if any size has a border."""
+
+        return any(b > 0 for b in (self.top, self.bottom, self.left, self.right))
+
+
 # Relative diff above which pixels are considered to be different colours for the purpose of border detection.
-BORDER_DIFF_COLOUR_THRESHOLD = 0.01
+# TODO? make this configurable
+BORDER_DIFF_COLOUR_THRESHOLD = 0.05
+
+# Proportion of pixels in a border size that are allowed to be different.
+# TODO? make this configurable
+BORDER_DIFF_PROPORTION_THRESHOLD = 0.01
 
 
-def has_border(image: Image.Image) -> bool:
-    """Checks if an image has a constant colour border on all sides."""
-    
+def detect_border(image: Image.Image, channel_diff_threshold: float = BORDER_DIFF_COLOUR_THRESHOLD,
+        pixel_count_threshold: float = BORDER_DIFF_PROPORTION_THRESHOLD) -> BorderSize:
+    """Infers the size of an image's border from pixel values.
+        The border must be uniform colour on all sides."""
+
     data = np.array(image)
+    # Shape is (height, width, channels)
 
-    ref_colour = data[0][0]
-    ref_magnitude = np.linalg.norm(ref_colour)
+    # Reference top left pixel, to which colours are compared
+    ref_colour = data[0, 0].astype(float)
+    # Relative differences are a proportion of the max pixel value.
+    diff_ref = np.max(data, axis=(0, 1))
 
-    sides = (
-        data[0][:],
-        data[-1][:],
-        data[:][0],
-        data[:][-1]
+    def is_same_colour(pixels: np.ndarray) -> bool:
+        # Cast to avoid clipping on unsigned pixel types.
+        pixels = pixels.astype(float)
+        diffs = pixels - ref_colour
+        # Each channel must be within the threshold.
+        different = np.abs(diffs) > channel_diff_threshold * diff_ref
+        total_pixels = pixels.shape[0] * pixels.shape[1]
+        different_proportion = np.count_nonzero(different) / total_pixels
+        overall_same = different_proportion <= pixel_count_threshold
+        return overall_same
+
+    def find_border(axis: int, reverse: bool) -> int:
+        depth = 1
+        while True:
+            index = -depth if reverse else depth - 1
+            side = data[index, :] if axis == 0 else data[:, index]
+            if not is_same_colour(side):
+                return depth - 1
+            depth += 1
+
+    return BorderSize(
+        top=find_border(0, False),
+        bottom=find_border(0, True),
+        left=find_border(1, False),
+        right=find_border(1, True)
     )
-    edge_pixels = np.concatenate(sides)
-
-    diffs = edge_pixels - ref_colour
-    diff_magnitude = np.linalg.norm(diffs, axis=1)
-    is_different = diff_magnitude > BORDER_DIFF_COLOUR_THRESHOLD * ref_magnitude
-    border = not np.any(is_different)
-
-    return border
 
 
-def calculate_border_size(size: tuple[int, int], min_aspect: float, max_aspect: float, baseline_border_size: float) \
-        -> tuple[int, int]:
-    """Calculates the desired border size in pixels, based on aspect ratio bounds.
-        Returned border sizes are per-side, not total."""
+def calculate_new_border_size(size: tuple[int, int], min_aspect: float, max_aspect: float, baseline_border_size: float) \
+        -> BorderSize:
+    """Calculates the desired border size in pixels, based on aspect ratio bounds."""
 
     # Try to create a constant-sized border according to baseline_border_size.
     # If the resulting image falls outside the aspect ratio bounds, expand the border in one dimension such that the
@@ -184,16 +226,25 @@ def calculate_border_size(size: tuple[int, int], min_aspect: float, max_aspect: 
         desired_height = new_width() / max_aspect
         border_height_pixels = ceil((desired_height - size[1]) / 2)
     
-    return (border_width_pixels, border_height_pixels)
+    return BorderSize(
+        top=border_height_pixels, bottom=border_height_pixels,
+        left=border_width_pixels, right=border_width_pixels)
 
 
 def apply_new_border(image: Image.Image, config: BorderConfig) \
         -> Image.Image:
-    border_size = calculate_border_size(
+    border_size = calculate_new_border_size(
         image.size, config.min_aspect_ratio, config.max_aspect_ratio, config.baseline_size)
-    new_image = ImageOps.expand(image, border=border_size, fill=config.colour.get_hex_l())
+    new_image = ImageOps.expand(image, border=border_size.pil_tuple, fill=config.colour.get_hex_l())
     logger.debug(
         f'New dimensions {new_image.width}x{new_image.height} (aspect ratio {new_image.width / new_image.height:.2f})')
+    return new_image
+
+
+def remove_border(image: Image.Image) -> Image.Image:
+    existing_border = detect_border(image)
+    new_size = existing_border.pil_tuple
+    new_image = image.crop(new_size)
     return new_image
 
 
@@ -229,11 +280,14 @@ def process_image(input_path: Path, output_path: Path, config: AppConfig) -> Non
         case ExistingBorderHandling.ADD:
             image = apply_new_border(image, config.border)    
         case ExistingBorderHandling.SKIP:
-            if has_border(image):
+            if detect_border(image):
                 logger.info('Skipping, border already present')
                 return
             else:
                 image = apply_new_border(image, config.border)
+        case ExistingBorderHandling.REPLACE:
+            image = remove_border(image)
+            image = apply_new_border(image, config.border)
         case _: # type: ignore
             raise AssertionError('Unhandled ExistingBorderHandling mode')
     
