@@ -144,10 +144,11 @@ class BorderSize:
 
         return (self.left, self.top, self.right, self.bottom)
 
-    def __bool__(self) -> bool:
-        """Truthy if any size has a border."""
+    @property
+    def all_sides(self) -> bool:
+        """Returns true if there is a border on all sides."""
 
-        return any(b > 0 for b in (self.top, self.bottom, self.left, self.right))
+        return all(b > 0 for b in (self.top, self.bottom, self.left, self.right))
 
 
 # Relative diff above which pixels are considered to be different colours for the purpose of border detection.
@@ -283,7 +284,7 @@ def process_image(input_path: Path, output_path: Path, config: AppConfig) -> Non
         case ExistingBorderHandling.ADD:
             image = apply_new_border(image, config.border)    
         case ExistingBorderHandling.SKIP:
-            if detect_border(image):
+            if detect_border(image).all_sides:
                 logger.info('Skipping, border already present')
                 return
             else:

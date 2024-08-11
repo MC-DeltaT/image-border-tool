@@ -27,3 +27,11 @@ def test_detect_border_black_border() -> None:
     img = Image.open(_test_data('border_black.jpg'))
     border = detect_border(img)
     assert border == BorderSize(top=149, bottom=151, left=349, right=351)
+
+
+def test_border_size_all_sides() -> None:
+    assert not BorderSize(0, 0, 0, 0).all_sides
+    assert not BorderSize(1, 0, 0, 0).all_sides
+    assert not BorderSize(1, 1, 0, 0).all_sides
+    assert not BorderSize(1, 1, 1, 0).all_sides
+    assert BorderSize(1, 1, 1, 1).all_sides
