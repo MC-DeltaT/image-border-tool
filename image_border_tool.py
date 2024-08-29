@@ -107,19 +107,37 @@ def log_config(config: AppConfig) -> None:
         logger.debug(f'Config: {field.name}: {getattr(config, field.name)}')
 
 
+# TODO? make this configurable
+SUPPORTED_IMAGE_EXTENSIONS = frozenset(('.jpg', '.jpeg', '.png'))
+
+
+def is_image_file_supported(p: Path) -> bool:
+    return p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+
+
 def get_input_file_paths(name_or_glob: str) -> list[Path]:
     if os.path.isfile(name_or_glob):
         # If path is a file, process just that file.
-        logger.debug(f'Input path is a file')
+        logger.debug('Input path is a file')
         return [Path(name_or_glob)]
     elif os.path.isdir(name_or_glob):
         # If path is a directory, process all files in that directory.
-        logger.debug(f'Input path is a directory, will process all contained files')
+        logger.debug('Input path is a directory, will process all contained image files')
         return [p for p in Path(name_or_glob).iterdir() if p.is_file()]
     else:
         # Otherwise, find files via glob.
-        logger.debug(f'Input path is a glob, will process all matching files')
+        logger.debug('Input path is a glob, will process all matching files')
         return [Path(p) for p in glob(name_or_glob) if os.path.isfile(p)]
+
+
+def filter_input_file_paths(paths: Iterable[Path]) -> list[Path]:
+    def filter_func(path: Path) -> bool:
+        if not is_image_file_supported(path):
+            logger.info(f'Ignored non-image file: \'{path}\'')
+            return False
+        return True
+    
+    return list(filter(filter_func, paths))
 
 
 def validate_output_paths(output_paths: Iterable[Path], allow_overwrite: bool) -> None:
@@ -272,9 +290,8 @@ def process_image(input_path: Path, output_path: Path, config: AppConfig) -> Non
     logger.info(f'Processing \'{input_path}\'')
     try:
         image = Image.open(input_path)
-    except Image.UnidentifiedImageError:
-        # Ignore files which are not images.
-        logger.info(f'Ignored non-image file')
+    except Image.UnidentifiedImageError as e:
+        logger.warn(str(e))
         return
 
     # We're trying to preserve as much as possible from the original image, so save the info now in case it's changed.
@@ -282,7 +299,7 @@ def process_image(input_path: Path, output_path: Path, config: AppConfig) -> Non
 
     match config.existing_border_handling:
         case ExistingBorderHandling.ADD:
-            image = apply_new_border(image, config.border)    
+            image = apply_new_border(image, config.border)
         case ExistingBorderHandling.SKIP:
             if detect_border(image).all_sides:
                 logger.info('Skipping, border already present')
@@ -328,6 +345,7 @@ def main(args: list[str]):
         log_config(config)
 
         input_file_paths = get_input_file_paths(config.input_path)
+        input_file_paths = filter_input_file_paths(input_file_paths)
         if not input_file_paths:
             logger.info('No files to process')
             return
