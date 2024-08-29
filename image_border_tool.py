@@ -291,7 +291,7 @@ def process_image(input_path: Path, output_path: Path, config: AppConfig) -> Non
     try:
         image = Image.open(input_path)
     except Image.UnidentifiedImageError as e:
-        logger.warn(str(e))
+        logger.warning(str(e))
         return
 
     # We're trying to preserve as much as possible from the original image, so save the info now in case it's changed.
