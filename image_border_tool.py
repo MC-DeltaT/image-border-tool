@@ -31,18 +31,41 @@ class ExistingBorderHandling(Enum):
 
 
 @dataclass(frozen=True)
-class BorderConfig:
-    colour: Color
-    baseline_size: float    # Proportional to image size
-    min_aspect_ratio: float
-    max_aspect_ratio: float
+class AspectRatioMode:
+    """Constraint on the final image aspect ratio, after applying the border.
+        Border size will be adjusted to meet this constraint."""
+
+    @staticmethod
+    def parse(s: str):
+        """Parse from CLI string value."""
+
+        if s == InstagramAspectRatio.VALUE:
+            return InstagramAspectRatio()
+        try:
+            return FixedAspectRatio(float(s))
+        except ValueError:
+            raise ValueError('Invalid aspect ratio')
+
+
+@dataclass(frozen=True)
+class InstagramAspectRatio(AspectRatioMode):
+    """Compatibility with Instagram."""
+
+    VALUE = 'instagram'
+
+
+@dataclass(frozen=True)
+class FixedAspectRatio(AspectRatioMode):
+    aspect_ratio: float
 
 
 @dataclass(frozen=True)
 class AppConfig:
     input_path: str     # File name or glob
     existing_border_handling: ExistingBorderHandling
-    border: BorderConfig
+    border_colour: Color
+    border_baseline_size: float # Proportional to image size
+    aspect_ratio_mode: AspectRatioMode
     output_directory: Path | None  # If none, output to input directory
     output_file_name_suffix: str
     allow_overwrite: bool
@@ -69,8 +92,10 @@ def get_config(args: list[str]) -> AppConfig:
         help='Border colour, as a W3C colour name.')
     parser.add_argument('--border-size', type=float, default=0.1,
         help='Baseline border size, as a proportion of the average image dimension.')
-    parser.add_argument('--min-aspect', type=float, default=0.84, help='Minimum aspect ratio.')
-    parser.add_argument('--max-aspect', type=float, default=1.2, help='Maximum aspect ratio.')
+    parser.add_argument('--aspect-ratio', type=AspectRatioMode.parse, required=True,
+        help='Constrains the output aspect ratio by adjusting the border size. '
+            '<number>: Force specific aspect ratio. '
+            f'{InstagramAspectRatio.VALUE}: Compatibility with Instagram.')
     parser.add_argument('--output-dir', type=Path, default=None,
         help='Output directory path. Defaults to output in the same directory as the input.')
     parser.add_argument('--output-suffix', type=str, default='-border', help='Output file name suffix.')
@@ -83,18 +108,12 @@ def get_config(args: list[str]) -> AppConfig:
 
     parsed = parser.parse_args(args)
 
-    if parsed.min_aspect > parsed.max_aspect:
-        raise AppError('Minimum aspect ratio must be <= maximum aspect ratio')
-
     return AppConfig(
         input_path=parsed.files,
         existing_border_handling=parsed.existing_border,
-        border=BorderConfig(
-            colour=parsed.border_colour,
-            baseline_size=parsed.border_size,
-            min_aspect_ratio=parsed.min_aspect,
-            max_aspect_ratio=parsed.max_aspect
-        ),
+        border_colour=parsed.border_colour,
+        border_baseline_size=parsed.border_size,
+        aspect_ratio_mode=parsed.aspect_ratio,
         output_directory=parsed.output_dir,
         output_file_name_suffix=parsed.output_suffix,
         allow_overwrite=parsed.overwrite,
@@ -118,15 +137,15 @@ def is_image_file_supported(p: Path) -> bool:
 def get_input_file_paths(name_or_glob: str) -> list[Path]:
     if os.path.isfile(name_or_glob):
         # If path is a file, process just that file.
-        logger.debug('Input path is a file')
+        logger.info('Input path is a file')
         return [Path(name_or_glob)]
     elif os.path.isdir(name_or_glob):
         # If path is a directory, process all files in that directory.
-        logger.debug('Input path is a directory, will process all contained image files')
+        logger.info('Input path is a directory, will process all contained image files')
         return [p for p in Path(name_or_glob).iterdir() if p.is_file()]
     else:
         # Otherwise, find files via glob.
-        logger.debug('Input path is a glob, will process all matching files')
+        logger.info('Input path is a glob, will process all matching files')
         return [Path(p) for p in glob(name_or_glob) if os.path.isfile(p)]
 
 
@@ -167,6 +186,12 @@ class BorderSize:
         """Returns true if there is a border on all sides."""
 
         return all(b > 0 for b in (self.top, self.bottom, self.left, self.right))
+
+    @property
+    def any_side(self) -> bool:
+        """Returns true if there is a border on any side."""
+
+        return any(b > 0 for b in (self.top, self.bottom, self.left, self.right))
 
 
 # Relative diff above which pixels are considered to be different colours for the purpose of border detection.
@@ -211,63 +236,111 @@ def detect_border(image: Image.Image, channel_diff_threshold: float = BORDER_DIF
                 return depth - 1
             depth += 1
 
-    return BorderSize(
+    border_size = BorderSize(
         top=find_border(0, False),
         bottom=find_border(0, True),
         left=find_border(1, False),
         right=find_border(1, True)
     )
+    logger.debug(f'Detect border: {border_size}')
+    return border_size
 
 
-def calculate_new_border_size(size: tuple[int, int], min_aspect: float, max_aspect: float, baseline_border_size: float) \
+Size = tuple[int, int]
+
+
+def adjust_aspect_ratio(base_aspect_ratio: float, mode: AspectRatioMode) -> float:
+    """Picks the nearest aspect ratio that's valid for the specific aspect ratio mode."""
+
+    logger.debug(f'Adjusting image aspect ratio {base_aspect_ratio:.2f} with mode {mode}')
+    match mode:
+        case FixedAspectRatio(aspect_ratio=aspect):
+            new_aspect = aspect
+        case InstagramAspectRatio():
+            # Valid aspect ratios for Instagram are 0.8, or in the range [1, 1.9].
+            # Discovered this by trial and error.
+            if base_aspect_ratio < 0.9:
+                new_aspect = 0.8
+            else:
+                new_aspect = max(1, min(base_aspect_ratio, 1.9))
+        case v:
+            raise AssertionError(f'Unhandled AspectRatioMode {v}')
+    logger.debug(f'New aspect ratio: {new_aspect:.2f}')
+    return new_aspect
+
+
+def adjust_border_for_aspect_ratio(base_image_size: Size, border_size: Size, aspect_ratio_mode: AspectRatioMode) -> Size:
+    base_width, base_height = base_image_size
+    # This is size each side, not total.
+    border_width, border_height = border_size
+
+    def new_width() -> int: return base_width + border_width * 2
+    def new_height() -> int: return base_height + border_height * 2
+    def new_aspect() -> float: return new_width() / new_height()
+    
+    final_aspect = adjust_aspect_ratio(new_aspect(), aspect_ratio_mode)
+
+    if new_aspect() < final_aspect:
+        # Too tall, add to left/right borders.
+        final_width = final_aspect * new_height()
+        border_width = ceil((final_width - base_image_size[0]) / 2)
+    elif new_aspect() > final_aspect:
+        # Too wide, add to top/bottom borders.
+        desired_height = new_width() / final_aspect
+        border_height = ceil((desired_height - base_image_size[1]) / 2)
+
+    logger.debug(f'Adjusted border size: width={border_width} height={border_height}')
+    return border_width, border_height
+
+
+def calculate_new_border_size(image_size: Size, baseline_border_size: float, aspect_ratio_mode: AspectRatioMode) \
         -> BorderSize:
-    """Calculates the desired border size in pixels, based on aspect ratio bounds."""
+    """Calculates the border size in pixels, based on aspect ratio mode."""
 
     # Try to create a constant-sized border according to baseline_border_size.
-    # If the resulting image falls outside the aspect ratio bounds, expand the border in one dimension such that the
-    # aspect ratio becomes within the bounds.
+    # If the resulting image falls outside the aspect ratio constraint, expand the border in one dimension such that the
+    # aspect ratio becomes within the constraint.
 
-    assert min_aspect <= max_aspect
-
-    width, height = size
-    avg_dim = np.mean(size)
-
+    avg_dim = np.mean(image_size)
     border_width_pixels = int(round(baseline_border_size * avg_dim))
     border_height_pixels = int(round(baseline_border_size * avg_dim))
 
-    def new_width() -> int: return width + border_width_pixels * 2
-    def new_height() -> int: return height + border_height_pixels * 2
-    def new_aspect() -> float: return new_width() / new_height()
+    logger.debug(f'Baseline border size: width={border_width_pixels} height={border_height_pixels}')
+
+    border_width_pixels, border_height_pixels = adjust_border_for_aspect_ratio(
+        image_size, (border_width_pixels, border_height_pixels), aspect_ratio_mode)
     
-    if new_aspect() < min_aspect:
-        # Too tall, add to left/right borders.
-        desired_width = min_aspect * new_height()
-        border_width_pixels = ceil((desired_width - size[0]) / 2)
-    elif new_aspect() > max_aspect:
-        # Too wide, add to top/bottom borders.
-        desired_height = new_width() / max_aspect
-        border_height_pixels = ceil((desired_height - size[1]) / 2)
-    
-    return BorderSize(
+    border_size = BorderSize(
         top=border_height_pixels, bottom=border_height_pixels,
         left=border_width_pixels, right=border_width_pixels)
+    logger.debug(f'Calculated new border size: {border_size}')
+    return border_size
 
 
-def apply_new_border(image: Image.Image, config: BorderConfig) \
+def apply_new_border(image: Image.Image, colour: Color, baseline_size: float, aspect_ratio_mode: AspectRatioMode) \
         -> Image.Image:
     border_size = calculate_new_border_size(
-        image.size, config.min_aspect_ratio, config.max_aspect_ratio, config.baseline_size)
-    new_image = ImageOps.expand(image, border=border_size.pil_tuple, fill=config.colour.get_hex_l())
-    logger.debug(
+        image.size, baseline_size, aspect_ratio_mode)
+    new_image = ImageOps.expand(image, border=border_size.pil_tuple, fill=colour.get_hex_l())
+    logger.info(
         f'New dimensions {new_image.width}x{new_image.height} (aspect ratio {new_image.width / new_image.height:.2f})')
     return new_image
 
 
 def remove_border(image: Image.Image) -> Image.Image:
     existing_border = detect_border(image)
-    new_size = existing_border.pil_tuple
-    new_image = image.crop(new_size)
-    return new_image
+    if existing_border.any_side:
+        new_size = (
+            existing_border.left,   # Left
+            existing_border.top,    # Top
+            image.width - existing_border.right,    # Right
+            image.height - existing_border.bottom,  # Bottom
+        )
+        logger.debug(f'Removing existing border, cropping to {new_size}')
+        new_image = image.crop(new_size)
+        return new_image
+    else:
+        return image
 
 
 def get_image_write_params(image: Image.Image) -> dict[str, Any]:
@@ -287,6 +360,9 @@ def get_image_write_params(image: Image.Image) -> dict[str, Any]:
 
 
 def process_image(input_path: Path, output_path: Path, config: AppConfig) -> None:
+    def apply_border_func(image: Image.Image) -> Image.Image:
+        return apply_new_border(image, config.border_colour, config.border_baseline_size, config.aspect_ratio_mode)
+
     logger.info(f'Processing \'{input_path}\'')
     try:
         image = Image.open(input_path)
@@ -299,18 +375,18 @@ def process_image(input_path: Path, output_path: Path, config: AppConfig) -> Non
 
     match config.existing_border_handling:
         case ExistingBorderHandling.ADD:
-            image = apply_new_border(image, config.border)
+            image = apply_border_func(image)
         case ExistingBorderHandling.SKIP:
             if detect_border(image).all_sides:
                 logger.info('Skipping, border already present')
                 return
             else:
-                image = apply_new_border(image, config.border)
+                image = apply_border_func(image)
         case ExistingBorderHandling.REPLACE:
             image = remove_border(image)
-            image = apply_new_border(image, config.border)
-        case _: # type: ignore
-            raise AssertionError('Unhandled ExistingBorderHandling mode')
+            image = apply_border_func(image)
+        case v: # type: ignore
+            raise AssertionError(f'Unhandled ExistingBorderHandling {v}')
     
     if config.dry_run:
         logger.info(f'Dry run: Would save image to \'{output_path}\'')
