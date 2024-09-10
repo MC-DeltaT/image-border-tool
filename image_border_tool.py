@@ -257,12 +257,13 @@ def adjust_aspect_ratio(base_aspect_ratio: float, mode: AspectRatioMode) -> floa
         case FixedAspectRatio(aspect_ratio=aspect):
             new_aspect = aspect
         case InstagramAspectRatio():
-            # Valid aspect ratios for Instagram are 0.8, or in the range [1, 1.9].
+            # Instagram will crop the image if the aspect ratio is not 0.8 or in the range [1, 1.9].
             # Discovered this by trial and error.
+            # However large aspect ratios don't look great in my opinion, so limit it to 1.25 (inverse of 0.8).
             if base_aspect_ratio < 0.9:
                 new_aspect = 0.8
             else:
-                new_aspect = max(1, min(base_aspect_ratio, 1.9))
+                new_aspect = max(1, min(base_aspect_ratio, 1 / 0.8))
         case v:
             raise AssertionError(f'Unhandled AspectRatioMode {v}')
     logger.debug(f'New aspect ratio: {new_aspect:.2f}')
